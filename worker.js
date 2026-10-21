@@ -1,7 +1,7 @@
 /* ============================================================
  * worker.js – Port von audioanalyse.py (librosa) nach Vanilla JS
  * Keine externen Bibliotheken: YIN, RMS, STFT/Mel, Onset-Detection
- * sind nach dem Quelltext von librosa (>= 0.10) nachgebaut.
+ * sind nach dem Quelltext von librosa 0.11.0 nachgebaut.
  * ============================================================ */
 'use strict';
 
@@ -31,7 +31,7 @@ const Config = {
   // librosa-Defaults (nicht im Python-Skript gesetzt, daher Defaults):
   FRAME_LENGTH: 2048,      // yin / rms / stft
   N_MELS: 128,             // onset_strength -> melspectrogram
-  MEL_FMAX: 11025.0,       // onset_strength setzt fmax=11025
+  MEL_FMAX: null,          // librosa 0.11: onset_strength setzt fmax=0.5*sr (null -> sr/2)
   TROUGH_THRESHOLD: 0.1,   // yin
   PAD_MODE: 'constant'     // librosa >= 0.10 ('reflect' fuer librosa < 0.10)
 };
@@ -175,76 +175,63 @@ function trimAudio(y, sr, maxDuration) {
  * Autokorrelation per FFT; zwei Frames werden zu einer komplexen FFT gepackt.
  */
 function computePitchAndRms(y, sr, cfg) {
-  const N = cfg.FRAME_LENGTH, WIN = N >> 1, HOP = cfg.HOP_LENGTH;
+  // librosa 0.11: autocorrelate() ueber den GANZEN Frame (linear, FFT-Laenge 2N),
+  // d[tau] = 2*(acf[0]-acf[tau]) - cumsum(x^2)[tau-1]; max_period = min(ceil(sr/fmin), N-1)
+  const N = cfg.FRAME_LENGTH, M = 2 * N, HOP = cfg.HOP_LENGTH;
   const nFrames = 1 + Math.floor(y.length / HOP);
   const minPeriod = Math.floor(sr / cfg.FMAX);
-  const maxPeriod = Math.min(Math.ceil(sr / cfg.FMIN), N - WIN - 1);
+  const maxPeriod = Math.min(Math.ceil(sr / cfg.FMIN), N - 1);
   const L = maxPeriod - minPeriod + 1;
   if (L < 3) throw new Error('Samplerate zu niedrig fuer YIN-Parameter');
   const thr = cfg.TROUGH_THRESHOLD;
-  const fft = makeFFT(N);
+  const fft = makeFFT(M);
 
   const f0 = new Float64Array(nFrames);
   const rms = new Float64Array(nFrames);
   const x = new Float64Array(N);
-  const zr = new Float64Array(N), zi = new Float64Array(N);
-  const p1r = new Float64Array(N), p1i = new Float64Array(N);
-  const p2r = new Float64Array(N), p2i = new Float64Array(N);
-  const qr = new Float64Array(N), qi = new Float64Array(N);
+  const zr = new Float64Array(M), zi = new Float64Array(M);
+  const qr = new Float64Array(M), qi = new Float64Array(M);
   const cs = [new Float64Array(N), new Float64Array(N)];
   const yin = new Float64Array(L);
 
   for (let f = 0; f < nFrames; f += 2) {
     const cnt = f + 1 < nFrames ? 2 : 1;
+    zr.fill(0); zi.fill(0);
 
     for (let p = 0; p < cnt; p++) {
       const fi = f + p;
       fillFrame(y, fi * HOP - (N >> 1), x, cfg.PAD_MODE);
-
-      // RMS + kumulative Energie
+      const tgt = p === 0 ? zr : zi;
       const c = cs[p];
       let acc = 0;
-      for (let k = 0; k < N; k++) { acc += x[k] * x[k]; c[k] = acc; }
+      for (let k = 0; k < N; k++) { tgt[k] = x[k]; acc += x[k] * x[k]; c[k] = acc; }
       rms[fi] = Math.sqrt(acc / N);
-
-      // z = a + i*b ; a = Frame, b[j] = x[WIN-j] (j<WIN), sonst 0
-      for (let j = 0; j < WIN; j++) { zr[j] = x[j]; zi[j] = x[WIN - j]; }
-      for (let j = WIN; j < N; j++) { zr[j] = x[j]; zi[j] = 0; }
-      fft(zr, zi);
-
-      const pr = p === 0 ? p1r : p2r, pi = p === 0 ? p1i : p2i;
-      for (let k = 0; k < N; k++) {
-        const m = (N - k) & (N - 1);
-        const ar = (zr[k] + zr[m]) * 0.5, ai = (zi[k] - zi[m]) * 0.5;
-        const br = (zi[k] + zi[m]) * 0.5, bi = -(zr[k] - zr[m]) * 0.5;
-        pr[k] = ar * br - ai * bi;
-        pi[k] = ar * bi + ai * br;
-      }
     }
-    if (cnt === 1) { p2r.fill(0); p2i.fill(0); }
 
-    // ifft(P1 + i*P2) = acf1 + i*acf2  (Trick: ifft(Q) = conj(fft(conj(Q)))/N)
-    for (let k = 0; k < N; k++) {
-      qr[k] = p1r[k] - p2i[k];
-      qi[k] = -(p1i[k] + p2r[k]);
+    // zwei reelle Frames in einer komplexen FFT: z = x1 + i*x2
+    fft(zr, zi);
+    for (let k = 0; k < M; k++) {
+      const m = (M - k) & (M - 1);
+      const ar = (zr[k] + zr[m]) * 0.5, ai = (zi[k] - zi[m]) * 0.5;
+      const br = (zi[k] + zi[m]) * 0.5, bi = -(zr[k] - zr[m]) * 0.5;
+      qr[k] = ar * ar + ai * ai;       // |X1|^2
+      qi[k] = -(br * br + bi * bi);    // -|X2|^2  (Konjugation fuer inverse FFT)
     }
-    fft(qr, qi);
+    fft(qr, qi); // ifft(Q) = conj(fft(conj(Q)))/M -> acf1 = qr/M, acf2 = -qi/M
 
     for (let p = 0; p < cnt; p++) {
       const fi = f + p;
       const c = cs[p];
-      const E0 = c[WIN] - c[0];
+      const acfAt = p === 0 ? (t) => qr[t] / M : (t) => -qi[t] / M;
+      const acf0 = acfAt(0);
 
-      // Differenzfunktion + kumulativ normierte Differenzfunktion
       let cum = 0;
       for (let tau = 1; tau <= maxPeriod; tau++) {
-        const acf = p === 0 ? qr[WIN + tau] / N : -qi[WIN + tau] / N;
-        const d = E0 + (c[WIN + tau] - c[tau]) - 2 * acf;
+        const d = 2 * (acf0 - acfAt(tau)) - c[tau - 1];
         cum += d;
         if (tau >= minPeriod) yin[tau - minPeriod] = d / (cum / tau + TINY_F32);
       }
 
-      // globales Minimum (erstes) + erster Trog unter Schwelle
       let globalMin = 0, minV = yin[0];
       for (let i = 1; i < L; i++) if (yin[i] < minV) { minV = yin[i]; globalMin = i; }
 
@@ -260,12 +247,12 @@ function computePitchAndRms(y, sr, cfg) {
       }
       if (chosen < 0) chosen = globalMin;
 
-      // parabolische Interpolation
+      // parabolische Interpolation (librosa _pi_stencil; Rand = 0)
       let shift = 0;
       if (chosen > 0 && chosen < L - 1) {
-        const a2 = yin[chosen - 1] + yin[chosen + 1] - 2 * yin[chosen]; // = 2a
+        const a = yin[chosen - 1] + yin[chosen + 1] - 2 * yin[chosen];
         const b = (yin[chosen + 1] - yin[chosen - 1]) / 2;
-        shift = Math.abs(b) >= Math.abs(a2) ? 0 : -b / (a2 + TINY_F32);
+        shift = Math.abs(b) >= Math.abs(a) ? 0 : -b / a;
       }
       f0[fi] = sr / (minPeriod + chosen + shift);
     }
@@ -338,7 +325,7 @@ function melFilterbank(sr, nFft, nMels, fmin, fmax) {
 function computeMelDb(y, sr, cfg) {
   const N = cfg.FRAME_LENGTH, HOP = cfg.HOP_LENGTH, NM = cfg.N_MELS, NB = (N >> 1) + 1;
   const nFrames = 1 + Math.floor(y.length / HOP);
-  const bands = melFilterbank(sr, N, NM, 0.0, cfg.MEL_FMAX);
+  const bands = melFilterbank(sr, N, NM, 0.0, cfg.MEL_FMAX || sr / 2);
   const fft = makeFFT(N);
 
   const win = new Float64Array(N); // Hann, periodisch (fftbins=True)
